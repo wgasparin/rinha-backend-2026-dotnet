@@ -1,0 +1,308 @@
+{
+  "meta": {
+    "product_or_system": "Módulo de Detecção de Fraude por Busca Vetorial (Rinha de Backend 2026)",
+    "feature_name": "POST /fraud-score",
+    "fdd_owner": "gasparin@gmail.com",
+    "version": "1.0",
+    "date": "2026-05-08"
+  },
+  "context": {
+    "technical_motivation": "Expor um endpoint HTTP que recebe uma transação de cartão e retorna, com p99 ≤ 1 ms, uma decisão de aprovar/negar baseada em busca vetorial sobre um dataset de 3M vetores rotulados. É o único caminho quente do sistema e é avaliado diretamente pelos componentes score_p99 e score_det da Rinha de Backend 2026.",
+    "fit_with_hld": "Vive na camada API .NET (Minimal API + Native AOT), em uma das duas instâncias balanceadas pelo HAProxy. Consome NormalizationConstants e MccRiskTable carregadas em memória no startup e consulta o Qdrant via gRPC para kNN k=5 sobre ReferenceVector[]. Implementada como vertical slice isolada (FraudScore/ com endpoint, handler, contratos e normalização juntos).",
+    "actors": [
+      "Avaliador da Rinha (cliente HTTP externo, único consumidor)",
+      "HAProxy (roteador upstream, round-robin entre 2 instâncias)",
+      "Qdrant (dependência síncrona via gRPC)"
+    ],
+    "assumptions": [
+      "O Qdrant está pronto e populado com a coleção references_v1 (3M vetores) quando o endpoint começa a receber tráfego (garantido pelo gate do GET /ready).",
+      "As constantes normalization.json e mcc_risk.json foram carregadas em memória no startup (read-only, imutáveis).",
+      "O HAProxy só envia tráfego para instâncias saudáveis (health check ativo).",
+      "Payloads seguem exatamente o contrato definido em API.md do desafio.",
+      "O cliente gRPC do Qdrant é compatível com .NET 10 Native AOT (sem warnings de trimming)."
+    ],
+    "constraints": [
+      "p99 alvo ≤ 1 ms para o endpoint inteiro (parsing, normalização, gRPC, agregação, serialização).",
+      "Footprint da instância da API ≤ 50–60 MB de RAM (envelope total de 350 MB compartilhado com Qdrant ~200 MB e HAProxy ~20 MB).",
+      "1 CPU compartilhada entre todos os serviços do compose.",
+      "Sem cache aplicativo, sem observabilidade em runtime, sem TLS.",
+      "Sem alocações desnecessárias no caminho quente (System.Text.Json source-generated, sem boxing, reuso de buffers).",
+      "Compatível com linux-amd64, modo de rede bridge."
+    ]
+  },
+  "technical_objectives": [
+    {
+      "objective": "Atender POST /fraud-score com p99 ≤ 1 ms sob carga do avaliador oficial",
+      "measure_or_invariant": "score_p99 da Rinha; meta direta no resultado do run.sh"
+    },
+    {
+      "objective": "Garantir decisão determinística para o mesmo payload e estado da coleção",
+      "measure_or_invariant": "Invariante: approved == (fraud_score < 0.6)"
+    },
+    {
+      "objective": "Implementar normalização das 14 dimensões exatamente conforme REGRAS_DE_DETECCAO.md",
+      "measure_or_invariant": "Invariante: byte-identidade com vetores de referência gerados pelas mesmas fórmulas"
+    },
+    {
+      "objective": "Executar kNN com k=5 sobre a coleção references_v1 para todo request",
+      "measure_or_invariant": "Invariante: fraud_score retornado é múltiplo de 0.2 no intervalo [0.0, 1.0]"
+    },
+    {
+      "objective": "Manter zero alocações evitáveis no caminho quente",
+      "measure_or_invariant": "Build sem warnings de trimming/AOT; uso de System.Text.Json source-generated; ArrayPool quando aplicável"
+    },
+    {
+      "objective": "Garantir schema de resposta fixo",
+      "measure_or_invariant": "100% das respostas 200 OK contêm exatamente { approved: bool, fraud_score: float }"
+    }
+  ],
+  "scope": {
+    "included": [
+      "Endpoint POST /fraud-score registrado via Minimal API",
+      "Deserialização do payload com System.Text.Json source-generated",
+      "Validação mínima de presença dos campos obrigatórios",
+      "Normalização in-memory do payload em vetor de 14 dimensões float32",
+      "Chamada gRPC Search ao Qdrant com k=5 sobre references_v1",
+      "Agregação dos rótulos retornados e cálculo de fraud_score",
+      "Serialização da resposta",
+      "Tratamento de erros mapeado em status 400/503"
+    ],
+    "excluded": [
+      "Endpoint GET /ready (feature separada)",
+      "Loader de ingestão dos 3M vetores no Qdrant (feature separada)",
+      "Treinamento ou atualização do dataset em runtime",
+      "Cache aplicativo de respostas ou de resultados de kNN",
+      "Autenticação, autorização, TLS",
+      "Logs, métricas, tracing em runtime (desabilitados por ADR-007)",
+      "Retries, circuit breaker, fallback alternativo",
+      "Rate limiting explícito"
+    ]
+  },
+  "detailed_flows": {
+    "main_flow": [
+      "HAProxy recebe POST /fraud-score na porta 9999 e roteia round-robin para uma das 2 APIs.",
+      "Kestrel da API .NET recebe a requisição.",
+      "Endpoint Minimal API deserializa o JSON via context source-generated.",
+      "Validação mínima: presença dos campos obrigatórios id, transaction, customer, merchant, terminal, last_transaction.",
+      "Normalização in-memory: aplica fórmulas de REGRAS_DE_DETECCAO.md usando NormalizationConstants e MccRiskTable para produzir vetor de 14 dimensões float32 em buffer reutilizável.",
+      "Chamada gRPC Search ao Qdrant com collection_name=references_v1, vector=<14 dim>, limit=5, parâmetros HNSW configurados (ef_search baixo para favorecer latência).",
+      "Qdrant retorna até 5 vizinhos com payload mínimo { label }.",
+      "Agregação: fraud_count = nº de vizinhos com label == 'fraud'.",
+      "Cálculo: fraud_score = fraud_count / 5.0.",
+      "Decisão: approved = fraud_score < 0.6.",
+      "Serialização e resposta 200 OK com { approved: <bool>, fraud_score: <float> }."
+    ],
+    "alternative_flows": [
+      "Payload malformado (JSON inválido) → resposta 400 Bad Request com corpo vazio ou mensagem mínima.",
+      "Campo obrigatório ausente → resposta 400 Bad Request.",
+      "Falha na chamada gRPC ao Qdrant (conexão, indisponibilidade) → resposta 503 Service Unavailable.",
+      "Timeout da chamada gRPC ao Qdrant (> 50 ms hipótese) → resposta 503 Service Unavailable.",
+      "Qdrant retorna menos de 5 vizinhos (não esperado) → calcula fraud_score sobre o que retornou (defensivo) e responde normalmente."
+    ],
+    "diagrams": [
+      "Sequência: Avaliador → HAProxy → API → Qdrant (gRPC Search) → API → HAProxy → Avaliador",
+      "Estados internos: Recebido → Validado → Normalizado → kNN → Agregado → Respondido"
+    ]
+  },
+  "public_contracts": [
+    {
+      "name": "POST /fraud-score",
+      "kind": "http_endpoint",
+      "signature_or_route": "POST /fraud-score",
+      "method": "POST",
+      "request_example": {
+        "id": "tx-123",
+        "transaction": { "amount": 384.88, "installments": 3, "requested_at": "2026-05-08T12:00:00Z" },
+        "customer": { "avg_amount": 769.76, "tx_count_24h": 3, "known_merchants": ["MERC-001"] },
+        "merchant": { "id": "MERC-001", "mcc": "5912", "avg_amount": 298.95 },
+        "terminal": { "is_online": false, "card_present": true, "km_from_home": 13.7 },
+        "last_transaction": { "timestamp": "2026-05-08T11:50:00Z", "km_from_current": 18.8 }
+      },
+      "response_example": { "approved": false, "fraud_score": 0.8 },
+      "headers_semantics": [
+        "Content-Type: application/json — obrigatório no request e response",
+        "Nenhum header customizado"
+      ],
+      "status_semantics": [
+        "200 OK — decisão calculada com sucesso",
+        "400 Bad Request — payload malformado ou campo obrigatório ausente",
+        "503 Service Unavailable — falha ou timeout na dependência Qdrant"
+      ],
+      "limits": {
+        "rate": "Sem limite explícito (controlado pelo avaliador)",
+        "payload_size": "~1–2 KB típico, hipótese de teto em 4 KB",
+        "timeout": "Timeout interno API → Qdrant: hipótese 50 ms"
+      },
+      "versioning": "Não versionado em URL (contrato fixo pela edição do desafio)"
+    }
+  ],
+  "errors_exceptions_fallback": {
+    "error_matrix": [
+      {
+        "condition": "JSON malformado",
+        "treatment": "400 Bad Request",
+        "notes": "Corpo mínimo ou vazio; sem log"
+      },
+      {
+        "condition": "Campo obrigatório ausente",
+        "treatment": "400 Bad Request",
+        "notes": "Validação curta-circuita antes de normalizar"
+      },
+      {
+        "condition": "MCC desconhecido",
+        "treatment": "Usa fallback default da MccRiskTable",
+        "notes": "Define-se valor neutro durante carga"
+      },
+      {
+        "condition": "Vetor fora de domínio numérico (NaN/Inf)",
+        "treatment": "400 Bad Request",
+        "notes": "Defensivo; não deveria ocorrer com payload válido"
+      },
+      {
+        "condition": "Falha de conexão com Qdrant",
+        "treatment": "503 Service Unavailable",
+        "notes": "Sem retry no caminho quente"
+      },
+      {
+        "condition": "Timeout gRPC > 50 ms (hipótese)",
+        "treatment": "503 Service Unavailable",
+        "notes": "Sem retry; aceitar perda em vez de duplicar custo"
+      },
+      {
+        "condition": "Qdrant retorna menos de 5 vizinhos",
+        "treatment": "Calcula score sobre o que retornou",
+        "notes": "Caso defensivo; não esperado com dataset completo"
+      }
+    ],
+    "resilience_strategies": ["timeouts"],
+    "fallback_policy": "Nenhum fallback de inferência (não inverter score, não chutar valor padrão). Em caso de falha de dependência, retornar 503 é preferível a responder com decisão sintética que penalizaria o score_det.",
+    "invariants": [
+      "fraud_score ∈ {0.0, 0.2, 0.4, 0.6, 0.8, 1.0} em condições normais (k=5, dataset completo)",
+      "approved == (fraud_score < 0.6) sempre",
+      "Resposta 200 OK sempre conforma o schema { approved: bool, fraud_score: float }",
+      "Endpoint é stateless: nenhuma instância persiste estado entre requisições",
+      "Normalização é determinística e idempotente sobre o mesmo payload"
+    ]
+  },
+  "observability": {
+    "metrics": [],
+    "logs": {
+      "format": "Nenhum log no caminho quente; apenas falha fatal de startup pode emitir uma linha em stderr",
+      "fields": []
+    },
+    "tracing": {
+      "spans": [],
+      "sampling": "Desabilitado (OpenTelemetry não habilitado)"
+    },
+    "dashboards_alerts": []
+  },
+  "dependencies_compatibility": {
+    "dependencies": [
+      {
+        "component": ".NET",
+        "min_version": "10.0",
+        "notes": "Native AOT habilitado; Minimal API"
+      },
+      {
+        "component": "Qdrant",
+        "min_version": "última estável linux-amd64 validada",
+        "notes": "Modo single-node; coleção references_v1 populada"
+      },
+      {
+        "component": "HAProxy",
+        "min_version": "última estável",
+        "notes": "Round-robin, health check em GET /ready"
+      },
+      {
+        "component": "Cliente gRPC Qdrant",
+        "min_version": "versão compatível com .NET 10 AOT",
+        "notes": "Qdrant.Client oficial ou proto custom gerado; verificar ausência de warnings de trimming"
+      },
+      {
+        "component": "System.Text.Json",
+        "min_version": "nativo do .NET 10",
+        "notes": "Source generation obrigatória (sem reflexão)"
+      },
+      {
+        "component": "Docker / Compose",
+        "min_version": "qualquer versão suportando linux-amd64 e modo bridge",
+        "notes": "Conforme regras do desafio"
+      }
+    ],
+    "compatibility_guarantees": [
+      "Contrato JSON do POST /fraud-score segue exatamente API.md da edição 2026 do desafio (sem versionamento em URL)",
+      "Coleção do Qdrant nomeada references_v1 permite re-ingestão futura sem quebrar o endpoint",
+      "Build AOT garante que mudanças de pacote dependente sejam detectadas em tempo de compilação (sem fallback dinâmico)",
+      "Sem versionamento semântico externo (artefato é um docker-compose imutável submetido ao desafio)"
+    ]
+  },
+  "acceptance_criteria": [
+    "p99 do POST /fraud-score ≤ 1 ms validado pelo run.sh local antes da submissão",
+    "100% das respostas 200 OK contêm exatamente as chaves approved (bool) e fraud_score (float)",
+    "approved é deterministicamente derivado de fraud_score < 0.6",
+    "fraud_score retornado é múltiplo de 0.2 em condições normais",
+    "Taxa de erro HTTP < 1% durante a execução do teste oficial",
+    "Build de release com AOT publica sem warnings de trimming nem AOT",
+    "Footprint da instância API observado via docker stats ≤ 60 MB sob carga",
+    "Validação cruzada: ao menos 5 payloads de exemplo do desafio produzem o mesmo fraud_score que a referência manual calculada com as fórmulas de REGRAS_DE_DETECCAO.md",
+    "Em falha simulada do Qdrant (container parado), endpoint responde 503 e nunca 200 com decisão sintética"
+  ],
+  "risks": [
+    {
+      "risk": "Latência da chamada gRPC ao Qdrant excede budget de p99",
+      "probability": "high",
+      "impact": "Estoura p99 ≤ 1 ms, perdendo pontos no score_p99",
+      "mitigation": [
+        "Conexão gRPC persistente (HTTP/2 multiplex) reusada entre requisições",
+        "HNSW configurado com ef_search baixo para minimizar trabalho do Qdrant",
+        "Quantização escalar int8 da coleção para reduzir cache miss",
+        "Co-localização API + Qdrant na mesma rede bridge do compose"
+      ],
+      "contingency_plan": "Trocar HNSW por busca exata SIMD em estrutura plana custom dentro do próprio processo da API se Qdrant não atingir budget"
+    },
+    {
+      "risk": "Alocações no caminho quente fragmentando o GC e elevando p99",
+      "probability": "high",
+      "impact": "p99 instável, gerando outliers que dominam a pontuação",
+      "mitigation": [
+        "System.Text.Json source-generated, sem reflexão",
+        "Reuso de buffers via ArrayPool<float> para o vetor de 14 dim",
+        "Evitar LINQ no caminho quente",
+        "Estruturas record struct para DTOs intermediários, evitando alocações em heap"
+      ],
+      "contingency_plan": "Utilitário dotnet-trace/dotnet-counters em build de dev para identificar pontos de alocação e refatorar"
+    },
+    {
+      "risk": "Custo de deserialização JSON consumindo orçamento de latência",
+      "probability": "medium",
+      "impact": "Parte significativa dos ~1 ms gasta antes mesmo da inferência",
+      "mitigation": [
+        "JsonSerializerContext com source generation",
+        "Tipos POCO concretos (sem polimorfismo, sem JsonElement dinâmico)",
+        "Considerar Utf8JsonReader direto se necessário em otimização final"
+      ],
+      "contingency_plan": "Parser custom mínimo focado apenas nos campos relevantes para a normalização"
+    },
+    {
+      "risk": "Cliente gRPC Qdrant incompatível com Native AOT",
+      "probability": "medium",
+      "impact": "Impossibilita compilação AOT, forçando JIT e degradando startup/footprint",
+      "mitigation": [
+        "Validar Qdrant.Client oficial em build AOT no início do desenvolvimento",
+        "Alternativa: gerar stubs gRPC a partir do .proto do Qdrant com Grpc.Tools configurado para AOT"
+      ],
+      "contingency_plan": "Fallback para chamadas REST ao Qdrant (perdendo binário) ou cliente HTTP/2 minimalista próprio"
+    },
+    {
+      "risk": "Divergência da normalização vs. dataset de referência",
+      "probability": "medium",
+      "impact": "Vizinhos retornados não correspondem semanticamente ao payload, prejudicando score_det",
+      "mitigation": [
+        "Implementar fórmulas exatamente conforme REGRAS_DE_DETECCAO.md",
+        "Testes unitários comparando vetores gerados com vetores esperados a partir de exemplos do desafio",
+        "Validação local com run.sh antes de cada submissão"
+      ],
+      "contingency_plan": "Ajuste fino de ef_search no Qdrant para aumentar recall, compensando ruído de normalização"
+    }
+  ]
+}

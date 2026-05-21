@@ -1,0 +1,59 @@
+# Topology: HAProxy → 2 × API instances (Native AOT, IVF in-process)
+# Envelope: 1 CPU total + 350 MB total. Allocated:
+#   haproxy : 0.30 CPU,  30 MB   (bumped from 0.20 — HAProxy saturado sob ramping-arrival-rate 900/s)
+#   api-1   : 0.35 CPU, 160 MB
+#   api-2   : 0.35 CPU, 160 MB
+#   total   : 1.00 CPU, 350 MB
+#
+# CFS period reduzido de default 100ms → 10ms via cpu_period/cpu_quota.
+# Mesmo CPU médio, janelas 10× menores cortam cauda de p99. Ver journey.md Fase 7.
+#
+# references_v1.bin (~45 MB) is part of the API image as a read-only layer;
+# both replicas mmap the same file path, so the OS page cache shares pages
+# between the two cgroups instead of duplicating.
+
+services:
+  api-1: &api
+    image: rinha-fraud-api:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    platform: linux/amd64
+    restart: unless-stopped
+    networks:
+      - rinha-net
+    # 0.35 CPU = 3.5ms / 10ms
+    cpu_period: 10000
+    cpu_quota: 3500
+    deploy:
+      resources:
+        limits:
+          memory: '160M'
+
+  api-2:
+    <<: *api
+
+  haproxy:
+    image: haproxy:3.0-alpine
+    platform: linux/amd64
+    restart: unless-stopped
+    depends_on:
+      - api-1
+      - api-2
+    ports:
+      - "9999:9999"
+    volumes:
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    networks:
+      - rinha-net
+    # 0.30 CPU = 3ms / 10ms
+    cpu_period: 10000
+    cpu_quota: 3000
+    deploy:
+      resources:
+        limits:
+          memory: '30M'
+
+networks:
+  rinha-net:
+    driver: bridge
