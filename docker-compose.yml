@@ -7,6 +7,7 @@
 #
 # CFS period reduzido de default 100ms → 10ms via cpu_period/cpu_quota.
 # Mesmo CPU médio, janelas 10× menores cortam cauda de p99. Ver journey.md Fase 7.
+# Rebalance experimental (0.40/0.30/0.30) em 2026-05-21 regrediu p99 em todos os cenários — revertido.
 #
 # references_v1.bin (~45 MB) is part of the API image as a read-only layer;
 # both replicas mmap the same file path, so the OS page cache shares pages

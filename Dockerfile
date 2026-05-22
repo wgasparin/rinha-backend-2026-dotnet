@@ -75,7 +75,9 @@ COPY --chown=$APP_UID:$APP_UID --from=loader  /out/references_v1.bin /data/refer
 ENV VECTORS_PATH=/data/references_v1.bin \
     ASPNETCORE_URLS=http://+:8080 \
     DOTNET_gcServer=1 \
-    DOTNET_GCConserveMemory=9
+    DOTNET_GCConserveMemory=9 \
+    DOTNET_GCHeapCount=1 \
+    DOTNET_GCNoAffinitize=1
 
 EXPOSE 8080
 

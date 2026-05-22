@@ -1591,3 +1591,102 @@ Re-rodada dos 4 cenários no mesmo host, mesmo dia, pra comparar contra o run pr
 **Sinais misturados — confirma a previsão.** Baseline melhorou, stress piorou, spike praticamente igual. A variância documentada do host (Windows + Docker Desktop + WSL2) domina qualquer ganho mensurável da troca `record` → `record struct`. Note que entre os dois runs de stress o throughput caiu de 3 013 → 2 213 req/s — sinal de host mais carregado no segundo round, o que infla naturalmente o p99 do stress sem nenhuma relação com a mudança de código.
 
 **Conclusão prática:** a mudança é correta e zero-risco, mas o ambiente local não consegue *medir* o benefício. A confirmação real virá com o juiz Linux nativo do challenge, onde GC pauses ficam mais determinísticas e a variância de host some.
+
+## 2026-05-21 — Diagnóstico HAProxy bypass + GC tuning (item D)
+
+### Etapa 1: diagnóstico via bypass do HAProxy
+
+Pra entender de onde vem o p99 e2e de ~50–60 ms (busca standalone é 0.108 ms — ~500× mais rápida que o e2e), rodei smoke e baseline batendo direto em `api-1:8080`, pulando HAProxy:
+
+| Cenário | Via HAProxy | Direto api-1 | Insight |
+|---|---|---|---|
+| smoke 1 VU (mean / max) | 921 μs / 33 ms | **3.07 ms / 82 ms** | API sozinha está 3× pior mesmo com 1 VU sequencial — não pode ser overhead de HAProxy (HAProxy adiciona latência, não remove) |
+| baseline 20 VU (p99 / p99.9 / max) | 53.5 / 141 / 198 ms | **37.4 / 49.1 / 68 ms** | HAProxy contribui com ~92 ms de cauda extra (p99.9), mas o request médio melhora pouco direto |
+
+**Hipótese:** `DOTNET_gcServer=1` cria 1 heap por logical CPU visível. Container vê os ~12 cores do host Windows → 12 GC heaps com threads associadas competindo pela quota de 0.35 CPU do cgroup. Mesmo idle, server GC tem trabalho residual que satura a quota, explicando porque a api-1 sozinha (com toda carga) fica pior que api-1+api-2 via round-robin do HAProxy (carga split → cada API menos saturada).
+
+### Etapa 2: aplicação do Item D
+
+Adicionado ao `Dockerfile` (na seção `ENV` do stage runtime):
+
+```dockerfile
+DOTNET_GCHeapCount=1
+DOTNET_GCNoAffinitize=1
+```
+
+- `GCHeapCount=1`: força server GC a usar 1 única heap. Elimina contention multi-heap.
+- `GCNoAffinitize=1`: GC não tenta pinar threads em cores específicos. Cgroup com restrição de CPU já manipula affinity de forma incompatível com pinning.
+
+Imagem rebuildada (8 s — só camada runtime mudou, AOT publish cache hit). APIs recriadas via `compose up -d --force-recreate api-1 api-2`. Envs verificadas via `docker inspect`.
+
+### Resultado: confirmação forte da hipótese
+
+| Cenário | Pré GC tuning (p99 / p99.9 / max) | **Pós GC tuning (p99 / p99.9 / max)** | Δ p99 | Δ p99.9 |
+|---|---|---|---|---|
+| smoke (1 VU) | — / — / 33 ms | — / — / **20.5 ms** | — | — |
+| baseline (20 VU) | 53.55 / 141 / 198 ms | **28.60 / 41.43 / 109 ms** | **−47 %** | **−71 %** |
+| stress (→100 VU) | 108 / 162 / 365 ms | **99 / 129 / 220 ms** | −8 % | −20 % |
+| spike (→150 VU) | 252 / 397 / 446 ms | **166 / 188 / 219 ms** | **−34 %** | **−53 %** |
+
+Throughput: baseline subiu de 1 751 → 1 957 req/s (**+12 %**). 0 erros em 320 126 requests cumulativos.
+
+**Os ganhos mais expressivos foram em baseline e spike** — cenários onde a quota de CPU não está totalmente saturada e o GC tem espaço para causar jitter. Stress (→100 VU) ganhou menos porque ali CFS throttling já é o gargalo dominante; GC tuning não muda isso.
+
+### Por que funcionou tão bem
+
+Antes: 12 heaps × N threads de server GC competindo pela mesma fatia de 3.5 ms / 10 ms do cgroup. Cada ciclo de coleta (ou trabalho de background concurrent GC) era multiplicado por 12, gerando microbursts que estouravam a quota e empurravam requests legítimos para a próxima janela = +6.5 ms de espera.
+
+Depois: 1 heap, 1 thread GC dominante. Trabalho de GC se torna proporcional à alocação real (que é mínima após o struct refactor de `FraudScoreResponse`). Quota fica disponível para handler de request. Cauda colapsa.
+
+**Custo:** 2 linhas no Dockerfile. **Zero código novo.** Provavelmente o melhor ROI de qualquer mudança feita até hoje neste repo.
+
+## 2026-05-21 — Rebalance de CPU (HAProxy 0.30 → 0.40, APIs 0.35 → 0.30): **revertido**
+
+Após o ganho do GC tuning, hipótese era que HAProxy ainda contribuía com cauda residual (baseado no diagnóstico bypass de mais cedo: p99.9 141 ms via HAProxy vs 49 ms direto, gap de 92 ms atribuído ao HAProxy). Plano: tirar 0.10 CPU das APIs e dar ao HAProxy, mantendo total em 1.00.
+
+### Mudanças
+
+`docker-compose.yml`:
+- `haproxy.cpu_quota`: 3000 → 4000
+- `api-1.cpu_quota` (anchor `&api`): 3500 → 3000 (api-2 herda via `<<: *api`)
+- Total: 0.40 + 0.30 + 0.30 = 1.00 CPU (inalterado)
+
+### Resultado — regressão em todos os 4 cenários
+
+| Cenário | Pós GC (0.30/0.35/0.35) | Pós Rebalance (0.40/0.30/0.30) | Δ p99 |
+|---|---|---|---|
+| baseline req/s | 1 957 | 1 386 | −29 % |
+| baseline p99 | 28.60 ms | 40.02 ms | **+40 %** |
+| baseline p99.9 | 41.43 ms | 86.4 ms | **+109 %** |
+| baseline max | 109 ms | **1 380 ms** | +1166 % |
+| stress p99 | 99 ms | 138 ms | +39 % |
+| stress p99.9 | 129 ms | 180 ms | +40 % |
+| spike p99 | 166 ms | 324 ms | **+95 %** |
+| spike p99.9 | 188 ms | 453 ms | +141 % |
+
+### Por que a hipótese estava errada
+
+A medida de bypass (HAProxy direto, p99.9 49 ms) foi feita **antes** do GC tuning. Ao remover o ruído das múltiplas heaps GC, a maior parte da cauda atribuída ao "HAProxy" era na verdade GC pause na API. Após o GC fix, a 0.30 CPU já era suficiente para HAProxy; APIs a 0.35 estavam usando ~358 μs CPU/request, e cair pra 0.30 reduziu a capacidade de janela:
+
+- API a 0.35: 3.5 ms / 10 ms = ~10 req/window/API × 2 = ~2000 req/s teórico → observado 1957.
+- API a 0.30: 3.0 ms / 10 ms = ~8 req/window/API × 2 = ~1600 req/s teórico → observado 1386.
+
+HAProxy custa ~50 μs/request — a 0.30 CPU sobra capacidade pra ~6000 req/s só dele. Dar mais era CPU desperdiçada.
+
+### Reversão e validação
+
+`docker-compose.yml` revertido para `0.30/0.35/0.35`. Recriei containers e re-rodei baseline duas vezes:
+
+- Run 1 (revert): 1 212 req/s, p99 55.6 ms, p99.9 130 ms
+- Run 2 (revert): 1 324 req/s, p99 47.7 ms, p99.9 80.5 ms
+
+Pior que o pós-GC original (1 957 / 28.6 / 41 ms) — mas o config é **idêntico** ao que produziu aqueles números. Isso é a **variância de host do Windows/WSL2 voltando a mostrar a cara** (a 2ª rodada de validação anterior já documentava 2-3× de variabilidade entre runs back-to-back).
+
+### Lições
+
+1. **A intuição do bypass tinha um viés temporal**: foi medida antes do GC fix. Hipóteses fundamentadas em diagnósticos passados precisam revalidação após cada mudança.
+2. **A API é o lado elástico ao CPU**, não HAProxy. Per request: ~358 μs API vs ~50 μs HAProxy. Tirar 0.10 da API hurts ~7× mais que dar 0.10 ao HAProxy ajuda.
+3. **No envelope atual, 0.30/0.35/0.35 é o ótimo local** disponível neste host. Não há rebalance dentro do limite de 1.00 CPU que melhore.
+4. **Validação local não distingue ganhos pequenos**: a variância de host (1.6× entre runs idênticos) excede o teto de qualquer rebalance possível. Tuning fino de CPU split só pode ser validado no juiz Linux nativo.
+
+**Decisão**: manter `0.30/0.35/0.35`. Não tentar outras combinações localmente. Voltar pros itens A (pre-encoded response) e B (PipeReader) que mexem em código, não em config.

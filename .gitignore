@@ -103,6 +103,7 @@ data-generator/main
 !.env.example
 src/appsettings.Local.json
 src/appsettings.*.Local.json
+.claude/settings.local.json
 
 # ---------- Misc ----------
 *.tmp
