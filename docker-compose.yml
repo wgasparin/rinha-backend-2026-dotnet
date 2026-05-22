@@ -7,11 +7,11 @@ services:
       - rinha-net
     # 0.35 CPU = 3.5ms / 10ms
     cpu_period: 10000
-    cpu_quota: 3500
     deploy:
       resources:
         limits:
           memory: '160M'
+          cpus: "0.35"
 
   api-2:
     <<: *api
@@ -31,11 +31,11 @@ services:
       - rinha-net
     # 0.30 CPU = 3ms / 10ms
     cpu_period: 10000
-    cpu_quota: 3000
     deploy:
       resources:
         limits:
           memory: '30M'
+          cpus: "0.30"
 
 networks:
   rinha-net:
