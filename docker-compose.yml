@@ -5,8 +5,6 @@ services:
     restart: unless-stopped
     networks:
       - rinha-net
-    # 0.35 CPU = 3.5ms / 10ms
-    cpu_period: 10000
     deploy:
       resources:
         limits:
@@ -29,8 +27,6 @@ services:
       - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
     networks:
       - rinha-net
-    # 0.30 CPU = 3ms / 10ms
-    cpu_period: 10000
     deploy:
       resources:
         limits:
