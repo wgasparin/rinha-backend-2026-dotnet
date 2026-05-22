@@ -1690,3 +1690,38 @@ Pior que o pós-GC original (1 957 / 28.6 / 41 ms) — mas o config é **idênti
 4. **Validação local não distingue ganhos pequenos**: a variância de host (1.6× entre runs idênticos) excede o teto de qualquer rebalance possível. Tuning fino de CPU split só pode ser validado no juiz Linux nativo.
 
 **Decisão**: manter `0.30/0.35/0.35`. Não tentar outras combinações localmente. Voltar pros itens A (pre-encoded response) e B (PipeReader) que mexem em código, não em config.
+
+---
+
+## 2026-05-22 — Re-run pós-remoção do `cpu_period` conflitante
+
+Trigger: ao tentar subir a stack na branch `submission` o Docker rejeitou com *“Conflicting options: Nano CPUs and CPU Period cannot both be set”*. O `docker-compose.yml` do root tinha `cpu_period: 10000` **e** `deploy.resources.limits.cpus: "0.35"`/`"0.30"` (NanoCPUs) — combinação inválida no Docker atual. Em `main`, as linhas `cpu_period: 10000` já estão comentadas (`# cpu_period: 10000`) com `cpus:` mantido. Stack recriada nesta config e harness `test/` re-rodado (smoke + oficial).
+
+### Resultados (`test/results.json`, 2026-05-22)
+
+| Métrica | Run anterior (`cpu_period` ativo) | Este run (`cpu_period` comentado) |
+|---|---|---|
+| Iterations | 53 945 / 54 100 | **54 059 / 54 100** |
+| Throughput final | 899.99 /s | **900.00 /s** |
+| p99 | 121.5 ms | **1.75 ms** |
+| FP / FN / err | 101 / 123 / 0 | 101 / 124 / 0 |
+| failure_rate | 0.42 % | 0.42 % |
+| p99_score | 915.30 | **2 757.42** |
+| detection_score | 1 257.95 | 1 255.27 |
+| **final_score** | 2 173.24 | **4 012.69** |
+
+### Leitura
+
+- p99 caiu **70×** sem mexer em código, quota ou rebalance. A única diferença vs o run de 2026-05-22 anterior é comentar as duas linhas `cpu_period: 10000`. Detecção idêntica (FP/FN/err praticamente iguais), confirmando que a mudança é puramente de CPU scheduling.
+- **Hipótese de mecanismo**: com NanoCPUs (`cpus: "0.35"`) o Docker calcula `cpu_quota` em cima do `cpu_period` default (100 ms) — `35000 µs / 100000 µs = 0.35`. Quando se sobrescreve `cpu_period` pra 10 000 µs **sem** ajustar `cpu_quota`, o quota efetivo aplicado no cgroup acaba descalibrado (versão dependente: alguns clientes aplicam 35000/10000 = 3.5 CPU; outros aplicam parcialmente o `cpu_period` mas ignoram NanoCPUs; outros erram out). No host atual (Docker recente em WSL2 Windows), o comportamento prévio inflava massivamente a cauda — o cgroup gastava o budget em poucos slots de cada janela e dormia o resto. Removendo `cpu_period`, volta ao par default `100000`/`35000` e a cauda desaparece.
+- Variância de host Windows/WSL2 está documentada em 1.6–3× — **70× é grande demais pra ser ruído**, a leitura da config quebrada é a explicação consistente.
+- Footprint praticamente igual (~36 MiB vs 38 MiB total). Envelope de 350 MB segue ~90 % ocioso.
+
+### Decisão
+
+- Manter `cpu_period` **comentado** no `docker-compose.yml` do root. Não há ganho em recolocar com NanoCPUs.
+- Migrar pra par explícito `cpu_period` + `cpu_quota` (sem `deploy.resources.limits.cpus`) é tecnicamente viável, mas abriria mão do schema `deploy.resources.limits` exigido pela competição — não fazer.
+- Confirmar o número no juiz Linux nativo. 1.75 ms está no regime onde 1 ms a mais move o score em 100+ pontos.
+- Não-objetivo desta sessão: tocar nenhum `.js` ou `docker-compose.yml` do diretório `test/` — restrição explícita do usuário no pedido.
+
+Memória relevante (re-confirmada): [[docker-cpu-limits-mutex]] — `cpus` (NanoCPUs) e `cpu_period`/`cpu_quota` são mutuamente exclusivos no compose; usuário escolheu o caminho NanoCPUs.
