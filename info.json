@@ -1,0 +1,7 @@
+{
+    "participants": ["Wellington Gasparin"],
+    "social": ["https://github.com/wgasparin", "https://www.linkedin.com/in/gasparin"],
+    "source-code-repo": "https://github.com/wgasparin/rinha-backend-2026-dotnet",
+    "stack": ["C#","dotnet", "haproxy"],
+    "open_to_work": true
+}

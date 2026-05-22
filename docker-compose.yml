@@ -1,0 +1,42 @@
+services:
+  api-1: &api
+    image: gasparin/rinha-backend-2026:latest
+    platform: linux/amd64
+    restart: unless-stopped
+    networks:
+      - rinha-net
+    # 0.35 CPU = 3.5ms / 10ms
+    cpu_period: 10000
+    cpu_quota: 3500
+    deploy:
+      resources:
+        limits:
+          memory: '160M'
+
+  api-2:
+    <<: *api
+
+  haproxy:
+    image: haproxy:3.0-alpine
+    platform: linux/amd64
+    restart: unless-stopped
+    depends_on:
+      - api-1
+      - api-2
+    ports:
+      - "9999:9999"
+    volumes:
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    networks:
+      - rinha-net
+    # 0.30 CPU = 3ms / 10ms
+    cpu_period: 10000
+    cpu_quota: 3000
+    deploy:
+      resources:
+        limits:
+          memory: '30M'
+
+networks:
+  rinha-net:
+    driver: bridge
