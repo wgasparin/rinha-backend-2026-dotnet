@@ -1,6 +1,6 @@
 services:
   api-1: &api
-    image: gasparin/rinha-backend-2026@sha256:ef5423c6aed39de968222c60c367f87da18d78f6bf2d59a42a99705cef3c4451
+    image: gasparin/rinha-backend-2026@sha256:6948918e46dc3d7a821da6510c979c24e9ddf806997cff4eb64e185d2fca0053
     platform: linux/amd64
     restart: unless-stopped
     networks:
