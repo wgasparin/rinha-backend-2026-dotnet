@@ -1,10 +1,15 @@
 services:
   api-1: &api
-    image: gasparin/rinha-backend-2026@sha256:fad34bc56666611b9f2c162bf7cd0ff7011cd91f663c2d1f9dcddd820c246811
+    image: gasparin/rinha-backend-2026@sha256:7dd5de1dededbf9dab701a3067c19de5fa898643ca67aa006bc374a4f7cdf0cf
     platform: linux/amd64
     restart: unless-stopped
     networks:
       - rinha-net
+    cpuset: "0"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
     deploy:
       resources:
         limits:
@@ -13,6 +18,7 @@ services:
 
   api-2:
     <<: *api
+    cpuset: "1"
 
   haproxy:
     image: haproxy:3.0-alpine
@@ -27,6 +33,7 @@ services:
       - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
     networks:
       - rinha-net
+    cpuset: "2,3"  
     deploy:
       resources:
         limits:
